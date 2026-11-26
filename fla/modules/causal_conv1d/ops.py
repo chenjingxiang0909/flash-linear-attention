@@ -994,6 +994,7 @@ class CausalConv1dFunction(torch.autograd.Function):
 
 
 @input_guard(no_guard_contiguous=["x"])
+@dispatch
 def causal_conv1d(
     x: torch.Tensor,
     weight: torch.Tensor | None = None,

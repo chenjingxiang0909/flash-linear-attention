@@ -15,6 +15,9 @@ from fla.backends import BaseBackend, register
 from fla.modules.norm.l2norm import l2norm
 from fla.ops.common.gate import fused_beta_sigmoid
 from fla.ops.kda.chunk import chunk_kda
+from fla.ops.kda.gate import kda_gate_chunk_cumsum
+from fla.ops.utils.constant import RCP_LN2
+from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 
@@ -53,11 +56,76 @@ class _AscendCChunkKDAFunction(torch.autograd.Function):
 
 
 @register(chunk_kda, env_var='FLA_KDA_ASCENDC')
+@register(kda_gate_chunk_cumsum, env_var='FLA_KDA_ASCENDC')
 class AscendCKDABackend(BaseBackend):
     backend_type = 'ascendc'
     package_name = 'fla_npu'
     default_enable = False
     priority = -1
+
+    def kda_gate_chunk_cumsum_verifier(
+        self, g, A_log, chunk_size, scale=None, dt_bias=None, cu_seqlens=None,
+        output_dtype=torch.float, chunk_indices=None, lower_bound=None, use_graph=False, **kwargs,
+    ):
+        if (
+            use_graph or kwargs or g.device.type != 'npu' or g.ndim != 4 or min(g.shape) <= 0
+            or torch.npu.is_current_stream_capturing()
+            or g.shape[-1] > 256 or chunk_size not in (32, 64, 128)
+            or g.dtype not in (torch.float32, torch.bfloat16, torch.float16)
+            or (output_dtype or g.dtype) not in (torch.float32, torch.bfloat16, torch.float16)
+            or (lower_bound is not None and not -5 <= lower_bound < 0)
+            or (scale is not None and not isfinite(scale))
+        ):
+            return False, 'AscendC KDA gate cumsum requires eager execution, K<=256, chunk=32/64/128 and supported gate options'
+        heads, width = g.shape[2:]
+        for tensor, size in ((A_log, heads), (dt_bias, heads * width)):
+            if tensor is not None and (
+                tensor.numel() != size or tensor.dtype != torch.float32 or tensor.device != g.device
+            ):
+                return False, 'AscendC KDA gate cumsum requires FP32 A_log and dt_bias on the input NPU'
+        if cu_seqlens is None:
+            if chunk_indices is not None:
+                return False, 'AscendC KDA gate cumsum requires packed offsets for chunk indices'
+        else:
+            if (
+                g.shape[0] != 1 or cu_seqlens.ndim != 1 or cu_seqlens.device != g.device
+                or cu_seqlens.dtype not in (torch.int32, torch.int64)
+            ):
+                return False, 'AscendC KDA gate cumsum requires packed B=1 and one-dimensional integer offsets'
+            offsets = cu_seqlens.tolist()
+            if (
+                len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != g.shape[1]
+                or any(b <= a for a, b in zip(offsets, offsets[1:]))
+            ):
+                return False, 'AscendC KDA gate cumsum requires nonempty sequences covering the input'
+            if chunk_indices is not None and not torch.equal(
+                chunk_indices, prepare_chunk_indices(cu_seqlens, chunk_size),
+            ):
+                return False, 'AscendC KDA gate cumsum requires canonical chunk indices'
+        from fla_npu.ops import ascendc
+
+        if not hasattr(ascendc, 'kda_gate_cumsum'):
+            return False, 'installed fla_npu wheel has no KDA gate cumsum entry point'
+        return True, None
+
+    @input_guard
+    def kda_gate_chunk_cumsum(
+        self, g, A_log, chunk_size, scale=None, dt_bias=None, cu_seqlens=None,
+        output_dtype=torch.float, chunk_indices=None, lower_bound=None, use_graph=False, **kwargs,
+    ):
+        from fla_npu.ops.ascendc import kda_gate_cumsum
+
+        a_log = g.new_zeros(g.shape[2], dtype=torch.float32) if A_log is None else A_log.flatten()
+        result = kda_gate_cumsum(
+            g.transpose(1, 2).contiguous(), chunk_size, A_log=a_log,
+            dt_bias=dt_bias.flatten() if dt_bias is not None else None,
+            cu_seqlens=cu_seqlens.tolist() if cu_seqlens is not None else None,
+            use_gate_in_kernel=True, safe_gate=lower_bound is not None, lower_bound=lower_bound,
+        )
+        # The wheel converts to log2 before accumulating. FLA applies an optional scale.
+        if scale != RCP_LN2:
+            result = result * ((1.0 if scale is None else scale) / RCP_LN2)
+        return result.transpose(1, 2).to(output_dtype or g.dtype).contiguous()
 
     def chunk_kda_verifier(
         self, q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False,

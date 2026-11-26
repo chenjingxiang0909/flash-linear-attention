@@ -28,7 +28,7 @@ __all__ = [
 
 
 if TritonAscendBackend.is_available():
-    from fla.modules.causal_conv1d.backends import triton_ascend  # noqa: F401
+    from fla.modules.causal_conv1d.backends import ascendc, triton_ascend  # noqa: F401
 
 if GluonBackend.is_available():
     from fla.modules.causal_conv1d.backends import gluon  # noqa: F401
