@@ -16,6 +16,7 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from fla.ops.cp.backends import ascendc
 from fla.ops.cp.comm import all_gather_into_tensor
 from fla.ops.utils.op import exp2
 from fla.utils import ascend_compile_kwargs, input_guard
@@ -832,8 +833,11 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
     g = _contig_gate(g, HV)
     block_size = _get_block_size(K, V)
+    use_ascendc = not use_graph and ascendc.is_enabled()
 
     def launch_fwd(hm_part, cu_win):
+        if use_ascendc and ascendc.preprocess_fwd(k, w, u, g, gk, bg, v, hm_part, cu_win, chunk_size):
+            return
         h_block = _h_block_size(K, V)
         base = {
             'k': k,
@@ -881,6 +885,9 @@ def chunk_gated_delta_rule_fwd_h_pre_process_npu(
         )
 
     def merge_fwd(h, ag, num_ranks, merge_rank, num_ranks_on_device):
+        if use_ascendc and ascendc.merge(h, ag, num_ranks, merge_rank, state_v_first, forward=True):
+            return
+
         def grid(meta):
             return (triton.cdiv(V, meta['BV']), HV)
         merge_fwd_bwd_kernel_npu[grid](
@@ -1003,8 +1010,11 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
         N = len(cu_seqlens) - 1
     g = _contig_gate(g, HV)
     block_size = _get_block_size(K, V)
+    use_ascendc = not use_graph and ascendc.is_enabled()
 
     def launch_bwd(dhm_part, cu_win):
+        if use_ascendc and ascendc.preprocess_bwd(q, k, w, do, dv, g, gk, bg, dhm_part, cu_win, scale, chunk_size):
+            return
         nv_chunks = triton.cdiv(V, block_size) + triton.cdiv(K, block_size)
         _launch_preprocess_kernel(
             pre_process_bwd_kernel_merged_npu,
@@ -1037,6 +1047,9 @@ def chunk_gated_delta_rule_bwd_dhu_pre_process_npu(
         )
 
     def merge_bwd(h, ag, num_ranks, merge_rank, h_seq_idx, num_ranks_on_device):
+        if use_ascendc and ascendc.merge(h, ag, num_ranks, merge_rank, state_v_first, forward=False):
+            return
+
         def grid(meta):
             return (triton.cdiv(V, meta['BV']), HV)
         merge_fwd_bwd_kernel_npu[grid](
